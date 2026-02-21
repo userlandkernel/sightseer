@@ -1,9 +1,14 @@
-// server.js - Main signaling server
 const express = require('express');
 const http = require('http');
 const socketIO = require('socket.io');
-const cors = require('cors');
+const { spawn } = require('child_process');
+const pty = require('node-pty');
 const path = require('path');
+const crypto = require('crypto');
+const session = require('express-session');
+const cookieParser = require('cookie-parser');
+const rateLimit = require('express-rate-limit');
+const fs = require('fs');
 const os = require('os');
 
 const app = express();
@@ -11,410 +16,414 @@ const server = http.createServer(app);
 const io = socketIO(server, {
     cors: {
         origin: "*",
-        methods: ["GET", "POST"],
-        credentials: true
-    },
-    transports: ['websocket', 'polling']
+        methods: ["GET", "POST"]
+    }
 });
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Store connected users
-const users = new Map(); // userId -> socketId
-const userSockets = new Map(); // socketId -> userId
-const userStatus = new Map(); // userId -> status (online, offline, in-call)
-const callSessions = new Map(); // callId -> { participants, startTime }
 
 // Configuration
-const PORT = process.env.PORT || 3000;
-const HOST = '0.0.0.0';
+const CONFIG = {
+    PASSWORD_HASH: crypto.createHash('sha256').update('secure123').digest('hex'), // Change this!
+    SESSION_SECRET: crypto.randomBytes(32).toString('hex'),
+    PORT: process.env.PORT || 3000,
+    MAX_SESSIONS: 10,
+    SESSION_TIMEOUT: 30 * 60 * 1000, // 30 minutes
+    RATE_LIMIT: 100, // requests per 15 minutes
+    ALLOWED_COMMANDS: [], // empty array means allow all
+    DENIED_COMMANDS: ['rm -rf', 'shutdown', 'reboot', 'init', 'poweroff'], // dangerous commands
+    LOG_ACTIONS: true
+};
 
-// Get local IP address
-function getLocalIP() {
-    const interfaces = os.networkInterfaces();
-    for (const name of Object.keys(interfaces)) {
-        for (const iface of interfaces[name]) {
-            if (iface.family === 'IPv4' && !iface.internal) {
-                return iface.address;
-            }
+// Store active sessions
+const activeSessions = new Map();
+const userSessions = new Map();
+
+// Middleware
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(cookieParser());
+app.use(session({
+    secret: CONFIG.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: true,
+    cookie: { 
+        secure: false, // set to true if using HTTPS
+        maxAge: CONFIG.SESSION_TIMEOUT,
+        httpOnly: true,
+        sameSite: 'strict'
+    }
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: CONFIG.RATE_LIMIT,
+    message: 'Too many requests from this IP'
+});
+app.use('/api/', limiter);
+
+// Logger
+function log(action, user, details = '') {
+    if (!CONFIG.LOG_ACTIONS) return;
+    
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] ${user} - ${action} ${details}\n`;
+    
+    console.log(logEntry.trim());
+    
+    // Append to log file
+    fs.appendFile('terminal.log', logEntry, (err) => {
+        if (err) console.error('Failed to write to log file:', err);
+    });
+}
+
+// Authentication middleware
+function authenticate(req, res, next) {
+    const authToken = req.cookies.authToken || req.headers['x-auth-token'];
+    
+    if (!authToken) {
+        return res.status(401).json({ error: 'Not authenticated' });
+    }
+    
+    const session = activeSessions.get(authToken);
+    if (!session) {
+        return res.status(401).json({ error: 'Invalid session' });
+    }
+    
+    // Check session expiry
+    if (Date.now() > session.expires) {
+        activeSessions.delete(authToken);
+        return res.status(401).json({ error: 'Session expired' });
+    }
+    
+    req.session = session;
+    next();
+}
+
+// Generate auth token
+function generateAuthToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+// Check if command is allowed
+function isCommandAllowed(command) {
+    // Check denied commands
+    for (const denied of CONFIG.DENIED_COMMANDS) {
+        if (command.includes(denied)) {
+            return false;
         }
     }
-    return 'localhost';
-}
-
-const LOCAL_IP = getLocalIP();
-
-// Logging utility
-function log(message, type = 'info') {
-    const timestamp = new Date().toISOString();
-    const prefix = type === 'error' ? '❌' : type === 'success' ? '✅' : '📢';
-    console.log(`${prefix} [${timestamp}] ${message}`);
-}
-
-// Cleanup inactive users
-function cleanupInactiveUsers() {
-    const now = Date.now();
-    // Users are considered inactive after 30 seconds of no heartbeat
-    // Implementation depends on heartbeat mechanism
-}
-
-// Broadcast user list to all connected clients
-function broadcastUserList() {
-    const userList = Array.from(users.keys());
-    const userStatusList = Array.from(userStatus.entries()).map(([userId, status]) => ({
-        userId,
-        status
-    }));
     
-    io.emit('user-list', userList);
-    io.emit('user-status-list', userStatusList);
-    log(`Broadcast user list: ${userList.length} users online`);
+    // If ALLOWED_COMMANDS is not empty, check if command is allowed
+    if (CONFIG.ALLOWED_COMMANDS.length > 0) {
+        const cmdBase = command.split(' ')[0];
+        return CONFIG.ALLOWED_COMMANDS.includes(cmdBase);
+    }
+    
+    return true;
 }
 
-// Socket.IO connection handling
-io.on('connection', (socket) => {
-    const clientAddress = socket.handshake.address;
-    log(`New client connected from ${clientAddress} (Socket ID: ${socket.id})`);
+// Sanitize command output
+function sanitizeOutput(output) {
+    // Remove ANSI escape sequences
+    return output.replace(/\u001b\[\d+m/g, '');
+}
 
-    // Handle user registration
-    socket.on('register', (userId) => {
-        log(`User registering: ${userId}`);
+// Routes
+
+// Authentication endpoint
+app.post('/api/auth', (req, res) => {
+    const { password } = req.body;
+    
+    if (!password) {
+        return res.status(400).json({ error: 'Password required' });
+    }
+    
+    const hash = crypto.createHash('sha256').update(password).digest('hex');
+    
+    if (hash === CONFIG.PASSWORD_HASH) {
+        const token = generateAuthToken();
+        const session = {
+            token,
+            created: Date.now(),
+            expires: Date.now() + CONFIG.SESSION_TIMEOUT,
+            ip: req.ip,
+            userAgent: req.get('User-Agent')
+        };
         
-        // Remove any existing registration for this user
-        if (users.has(userId)) {
-            const oldSocketId = users.get(userId);
-            if (oldSocketId !== socket.id) {
-                io.to(oldSocketId).emit('force-disconnect', 'Another client connected with same ID');
-                userSockets.delete(oldSocketId);
-            }
-        }
+        activeSessions.set(token, session);
+        userSessions.set(req.ip, token);
         
-        // Register user
-        users.set(userId, socket.id);
-        userSockets.set(socket.id, userId);
-        userStatus.set(userId, 'online');
-        
-        // Store userId in socket for easy access
-        socket.userId = userId;
-        
-        // Send confirmation
-        socket.emit('registration-success', {
-            userId,
-            timestamp: new Date().toISOString()
+        // Set cookie
+        res.cookie('authToken', token, {
+            maxAge: CONFIG.SESSION_TIMEOUT,
+            httpOnly: true,
+            sameSite: 'strict'
         });
         
-        // Broadcast updated user list
-        broadcastUserList();
+        log('LOGIN_SUCCESS', req.ip, `Token: ${token.substring(0,8)}...`);
         
-        // Notify others
-        socket.broadcast.emit('participant-joined', { userId });
-        
-        log(`User ${userId} registered successfully`, 'success');
-    });
+        res.json({ 
+            success: true, 
+            token,
+            expires: session.expires
+        });
+    } else {
+        log('LOGIN_FAILED', req.ip, 'Invalid password');
+        res.status(401).json({ error: 'Invalid password' });
+    }
+});
 
-    // Handle call initiation
-    socket.on('call-user', (data) => {
-        const { to, from } = data;
-        log(`Call initiated from ${from} to ${to}`);
+// Logout endpoint
+app.post('/api/logout', authenticate, (req, res) => {
+    const token = req.cookies.authToken;
+    activeSessions.delete(token);
+    userSessions.delete(req.ip);
+    
+    res.clearCookie('authToken');
+    
+    log('LOGOUT', req.ip);
+    
+    res.json({ success: true });
+});
+
+// Check session status
+app.get('/api/status', authenticate, (req, res) => {
+    res.json({
+        authenticated: true,
+        expires: req.session.expires,
+        server: os.hostname(),
+        platform: os.platform(),
+        release: os.release()
+    });
+});
+
+// Execute command (alternative to WebSocket)
+app.post('/api/execute', authenticate, (req, res) => {
+    const { command } = req.body;
+    
+    if (!command) {
+        return res.status(400).json({ error: 'Command required' });
+    }
+    
+    if (!isCommandAllowed(command)) {
+        log('COMMAND_DENIED', req.ip, command);
+        return res.status(403).json({ error: 'Command not allowed' });
+    }
+    
+    log('COMMAND_EXEC', req.ip, command);
+    
+    // Execute command
+    const exec = require('child_process').exec;
+    exec(command, {
+        timeout: 10000, // 10 second timeout
+        maxBuffer: 1024 * 1024 // 1MB buffer
+    }, (error, stdout, stderr) => {
+        const result = {
+            command,
+            stdout: sanitizeOutput(stdout),
+            stderr: sanitizeOutput(stderr),
+            code: error ? error.code : 0
+        };
         
-        const targetSocketId = users.get(to);
-        if (targetSocketId) {
-            // Check if target is available
-            if (userStatus.get(to) === 'online') {
-                userStatus.set(from, 'in-call');
-                userStatus.set(to, 'in-call');
-                
-                io.to(targetSocketId).emit('incoming-call', {
-                    from,
-                    timestamp: new Date().toISOString()
-                });
-                
-                socket.emit('call-initiated', { to });
-                log(`Call initiated successfully`, 'success');
-            } else {
-                socket.emit('call-failed', {
-                    reason: 'User is busy',
-                    to
-                });
-                log(`Call failed: ${to} is busy`, 'error');
+        res.json(result);
+    });
+});
+
+// Get system info
+app.get('/api/system', authenticate, (req, res) => {
+    const info = {
+        hostname: os.hostname(),
+        platform: os.platform(),
+        arch: os.arch(),
+        release: os.release(),
+        uptime: os.uptime(),
+        cpus: os.cpus().length,
+        memory: {
+            total: os.totalmem(),
+            free: os.freemem(),
+            used: os.totalmem() - os.freemem()
+        },
+        loadavg: os.loadavg(),
+        user: os.userInfo().username,
+        shell: process.env.SHELL || '/bin/bash'
+    };
+    
+    res.json(info);
+});
+
+// Socket.IO for real-time terminal
+io.use((socket, next) => {
+    const token = socket.handshake.auth.token;
+    
+    if (!token) {
+        return next(new Error('Authentication required'));
+    }
+    
+    const session = activeSessions.get(token);
+    if (!session) {
+        return next(new Error('Invalid session'));
+    }
+    
+    if (Date.now() > session.expires) {
+        activeSessions.delete(token);
+        return next(new Error('Session expired'));
+    }
+    
+    socket.session = session;
+    next();
+});
+
+io.on('connection', (socket) => {
+    const session = socket.session;
+    log('SOCKET_CONNECT', session.ip, `Socket ID: ${socket.id}`);
+    
+    let ptyProcess = null;
+    let commandBuffer = '';
+    
+    // Create pseudo-terminal
+    try {
+        // Get user's default shell
+        const shell = process.env.SHELL || (os.platform() === 'win32' ? 'powershell.exe' : '/bin/bash');
+        const shellArgs = os.platform() === 'win32' ? [] : ['--login'];
+        
+        ptyProcess = pty.spawn(shell, shellArgs, {
+            name: 'xterm-color',
+            cols: 80,
+            rows: 24,
+            cwd: process.env.HOME || os.homedir(),
+            env: process.env
+        });
+        
+        log('PTY_CREATED', session.ip, `Shell: ${shell}`);
+        
+        // Send initial message
+        ptyProcess.write('clear\n');
+        
+        // Handle PTY output
+        ptyProcess.on('data', (data) => {
+            socket.emit('output', data.toString());
+        });
+        
+        // Handle PTY exit
+        ptyProcess.on('exit', (code) => {
+            log('PTY_EXIT', session.ip, `Exit code: ${code}`);
+            socket.emit('exit', code);
+        });
+        
+    } catch (error) {
+        log('PTY_ERROR', session.ip, error.message);
+        socket.emit('error', 'Failed to create terminal session');
+        return;
+    }
+    
+    // Handle client input
+    socket.on('input', (data) => {
+        if (!ptyProcess) return;
+        
+        // Check for dangerous commands
+        if (data === '\r') { // Enter key
+            const command = commandBuffer.trim();
+            if (command && !isCommandAllowed(command)) {
+                ptyProcess.write(`echo "Command '${command}' is not allowed"\n`);
+                commandBuffer = '';
+                return;
             }
-        } else {
-            socket.emit('call-failed', {
-                reason: 'User not found',
-                to
-            });
-            log(`Call failed: ${to} not found`, 'error');
+            log('COMMAND_INPUT', session.ip, commandBuffer);
+        }
+        
+        commandBuffer += data;
+        
+        // Reset buffer on newline
+        if (data === '\r' || data === '\n') {
+            commandBuffer = '';
+        }
+        
+        ptyProcess.write(data);
+    });
+    
+    // Resize terminal
+    socket.on('resize', (data) => {
+        if (ptyProcess) {
+            ptyProcess.resize(data.cols, data.rows);
         }
     });
-
-    // Handle call acceptance
-    socket.on('accept-call', (data) => {
-        const { to, from } = data;
-        log(`Call accepted by ${from} for call with ${to}`);
-        
-        const targetSocketId = users.get(to);
-        if (targetSocketId) {
-            // Create call session
-            const callId = `${from}-${to}-${Date.now()}`;
-            callSessions.set(callId, {
-                participants: [from, to],
-                startTime: Date.now(),
-                socketIds: [socket.id, targetSocketId]
-            });
-            
-            io.to(targetSocketId).emit('call-accepted', {
-                from,
-                callId,
-                timestamp: new Date().toISOString()
-            });
-            
-            log(`Call ${callId} accepted`, 'success');
+    
+    // Clear terminal
+    socket.on('clear', () => {
+        if (ptyProcess) {
+            ptyProcess.write('clear\n');
         }
     });
-
-    // Handle call rejection
-    socket.on('reject-call', (data) => {
-        const { to, from } = data;
-        log(`Call rejected by ${from}`);
-        
-        const targetSocketId = users.get(to);
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('call-rejected', {
-                from,
-                reason: 'User rejected the call'
-            });
-        }
-        
-        // Reset status
-        userStatus.set(from, 'online');
-        userStatus.set(to, 'online');
-        
-        log(`Call rejected`, 'info');
-    });
-
-    // Handle WebRTC offer
-    socket.on('offer', (data) => {
-        const { to, from, offer } = data;
-        log(`Forwarding WebRTC offer from ${from} to ${to}`);
-        
-        const targetSocketId = users.get(to);
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('offer', {
-                from,
-                offer,
-                timestamp: new Date().toISOString()
-            });
+    
+    // Interrupt process (Ctrl+C)
+    socket.on('interrupt', () => {
+        if (ptyProcess) {
+            ptyProcess.write('\x03');
         }
     });
-
-    // Handle WebRTC answer
-    socket.on('answer', (data) => {
-        const { to, from, answer } = data;
-        log(`Forwarding WebRTC answer from ${from} to ${to}`);
-        
-        const targetSocketId = users.get(to);
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('answer', {
-                from,
-                answer,
-                timestamp: new Date().toISOString()
-            });
-        }
-    });
-
-    // Handle ICE candidates
-    socket.on('ice-candidate', (data) => {
-        const { to, from, candidate } = data;
-        log(`Forwarding ICE candidate from ${from} to ${to}`);
-        
-        const targetSocketId = users.get(to);
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('ice-candidate', {
-                from,
-                candidate,
-                timestamp: new Date().toISOString()
-            });
-        }
-    });
-
-    // Handle call end
-    socket.on('end-call', (data) => {
-        const { to, from } = data;
-        log(`Call ended by ${from}`);
-        
-        // Reset status for both participants
-        userStatus.set(from, 'online');
-        
-        const targetSocketId = users.get(to);
-        if (targetSocketId) {
-            userStatus.set(to, 'online');
-            io.to(targetSocketId).emit('call-ended', {
-                from,
-                timestamp: new Date().toISOString()
-            });
-        }
-        
-        // Find and remove call session
-        for (const [callId, session] of callSessions.entries()) {
-            if (session.participants.includes(from) && session.participants.includes(to)) {
-                callSessions.delete(callId);
-                log(`Call session ${callId} ended`, 'info');
-                break;
-            }
-        }
-        
-        log(`Call ended`, 'info');
-    });
-
-    // Handle typing indicator (optional)
-    socket.on('typing', (data) => {
-        const { to, from, isTyping } = data;
-        const targetSocketId = users.get(to);
-        if (targetSocketId) {
-            io.to(targetSocketId).emit('typing', { from, isTyping });
-        }
-    });
-
-    // Handle disconnection
+    
+    // Handle disconnect
     socket.on('disconnect', () => {
-        const userId = userSockets.get(socket.id);
-        log(`Client disconnected: ${userId || socket.id}`);
+        log('SOCKET_DISCONNECT', session.ip);
         
-        if (userId) {
-            // Notify others
-            socket.broadcast.emit('participant-left', { userId });
-            
-            // Clean up
-            users.delete(userId);
-            userSockets.delete(socket.id);
-            userStatus.delete(userId);
-            
-            // Update user list
-            broadcastUserList();
-            
-            log(`User ${userId} removed from active users`, 'info');
-        }
-    });
-
-    // Handle heartbeat
-    socket.on('heartbeat', () => {
-        const userId = userSockets.get(socket.id);
-        if (userId) {
-            // Update last seen timestamp
-            // Could be used for cleanup
-        }
-    });
-
-    // Handle error
-    socket.on('error', (error) => {
-        log(`Socket error for ${socket.id}: ${error.message}`, 'error');
-    });
-});
-
-// REST API endpoints
-app.get('/api/status', (req, res) => {
-    res.json({
-        status: 'online',
-        usersOnline: users.size,
-        timestamp: new Date().toISOString(),
-        serverInfo: {
-            host: LOCAL_IP,
-            port: PORT
+        if (ptyProcess) {
+            ptyProcess.kill();
+            ptyProcess = null;
         }
     });
 });
 
-app.get('/api/users', (req, res) => {
-    const userList = Array.from(users.keys()).map(userId => ({
-        userId,
-        status: userStatus.get(userId) || 'unknown'
-    }));
-    res.json(userList);
-});
-
-app.get('/api/user/:userId', (req, res) => {
-    const { userId } = req.params;
-    const isOnline = users.has(userId);
-    const status = userStatus.get(userId) || 'offline';
+// Cleanup expired sessions
+setInterval(() => {
+    const now = Date.now();
     
-    res.json({
-        userId,
-        isOnline,
-        status,
-        timestamp: new Date().toISOString()
-    });
-});
+    for (const [token, session] of activeSessions.entries()) {
+        if (now > session.expires) {
+            activeSessions.delete(token);
+            log('SESSION_EXPIRED', session.ip, `Token: ${token.substring(0,8)}...`);
+        }
+    }
+}, 60 * 1000); // Check every minute
 
-app.get('/api/calls/active', (req, res) => {
-    const activeCalls = Array.from(callSessions.entries()).map(([callId, session]) => ({
-        callId,
-        participants: session.participants,
-        duration: Date.now() - session.startTime
-    }));
-    
-    res.json({
-        count: activeCalls.length,
-        calls: activeCalls
-    });
-});
-
-// Serve the main HTML file for all other routes
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Error handling middleware
+// Error handling
 app.use((err, req, res, next) => {
-    log(`Error: ${err.message}`, 'error');
-    res.status(500).json({
-        error: 'Internal server error',
-        message: err.message
-    });
+    console.error('Server error:', err);
+    res.status(500).json({ error: 'Internal server error' });
 });
 
 // Start server
-server.listen(PORT, HOST, () => {
-    console.log('\n' + '='.repeat(50));
-    console.log('🚀 Video Call Signaling Server');
-    console.log('='.repeat(50));
-    console.log(`📡 Local:    http://localhost:${PORT}`);
-    console.log(`📡 Network:  http://${LOCAL_IP}:${PORT}`);
-    console.log(`👥 Users online: ${users.size}`);
-    console.log(`📊 Status API: http://localhost:${PORT}/api/status`);
-    console.log('='.repeat(50) + '\n');
+server.listen(CONFIG.PORT, '0.0.0.0', () => {
+    console.log('\n' + '='.repeat(60));
+    console.log('🔐 Secure Web Terminal Server');
+    console.log('='.repeat(60));
+    console.log(`📡 URL:        http://localhost:${CONFIG.PORT}`);
+    console.log(`🔑 Password:   ${Object.keys(CONFIG.PASSWORD_HASH).length > 0 ? '✓ Set' : '⚠ Default password'}`);
+    console.log(`⏱ Session:     ${CONFIG.SESSION_TIMEOUT/60000} minutes`);
+    console.log(`🛡 Rate Limit:  ${CONFIG.RATE_LIMIT} requests/15min`);
+    console.log(`📝 Logging:    ${CONFIG.LOG_ACTIONS ? 'Enabled' : 'Disabled'}`);
+    console.log('='.repeat(60));
+    console.log(`📊 Active sessions: ${activeSessions.size}`);
+    console.log('='.repeat(60) + '\n');
 });
-
-// Periodic stats logging
-setInterval(() => {
-    log(`Stats - Users: ${users.size}, Active calls: ${callSessions.size}`, 'info');
-}, 30000);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-    log('Received SIGTERM, shutting down gracefully...');
+    console.log('Received SIGTERM, shutting down gracefully...');
+    
+    // Kill all PTY processes
     server.close(() => {
-        log('Server closed');
+        console.log('Server closed');
         process.exit(0);
     });
 });
 
 process.on('SIGINT', () => {
-    log('Received SIGINT, shutting down gracefully...');
-    server.close(() => {
-        log('Server closed');
-        process.exit(0);
-    });
+    console.log('Received SIGINT, shutting down...');
+    process.exit(0);
 });
 
-// Handle uncaught exceptions
+// Uncaught exception handler
 process.on('uncaughtException', (error) => {
-    log(`Uncaught Exception: ${error.message}`, 'error');
-    console.error(error.stack);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    log(`Unhandled Rejection at: ${promise}, reason: ${reason}`, 'error');
+    console.error('Uncaught Exception:', error);
+    log('UNCAUGHT_EXCEPTION', 'SYSTEM', error.message);
 });
