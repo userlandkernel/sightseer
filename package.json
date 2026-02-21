@@ -1,7 +1,7 @@
 {
   "name": "secure-web-terminal",
   "version": "1.0.0",
-  "description": "Password protected web terminal with real Linux shell access",
+  "description": "Password protected web terminal with real shell access (No Python required)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -12,18 +12,17 @@
     "terminal",
     "web-terminal",
     "shell",
-    "ssh",
     "linux",
     "framework7",
     "ios",
-    "secure"
+    "secure",
+    "no-python"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "socket.io": "^4.5.4",
-    "node-pty": "^0.10.1",
     "express-session": "^1.17.3",
     "cookie-parser": "^1.4.6",
     "express-rate-limit": "^6.7.0",
